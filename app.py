@@ -324,6 +324,38 @@ def load_both(code: str, idx_sym: str, bars: int):
     idx = to_bars(i1, BAR_MIN) if not i1.empty else None
     return stock, idx, src
 
+US_IDX_YF = {"IXIC": "^IXIC", "US500": "^GSPC"}   # 나스닥 종합 / S&P500
+
+
+def _yf_5m(sym: str) -> pd.DataFrame:
+    """야후 파이낸스 5분봉 (정규장 09:30~16:00 뉴욕시간). 인덱스 = 뉴욕시간(시간대 표시 없음)"""
+    import yfinance as yf
+    d = yf.Ticker(sym).history(period=f"{FETCH_DAYS}d", interval=f"{BAR_MIN}m",
+                               prepost=False, auto_adjust=False, actions=False)
+    if d is None or d.empty:
+        return pd.DataFrame(columns=COLS)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    d = d[[c for c in COLS if c in d.columns]].copy()
+    idx = d.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("America/New_York").tz_localize(None)
+    d.index = idx
+    d = d.dropna(subset=["Close"])
+    return d[d["Close"] > 0].sort_index()
+
+
+@st.cache_data(ttl=50, show_spinner=False)
+def load_us5(code: str, idx_sym: str, bars: int):
+    """미국 종목·지수 5분봉을 동시에 받는다. 지수는 실패하면 None"""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_s = ex.submit(_yf_5m, code.replace(".", "-"))
+        f_i = ex.submit(_safe, _yf_5m, US_IDX_YF.get(idx_sym, "^GSPC"))
+        stock = f_s.result().tail(int(bars))
+        idx = f_i.result()
+    return stock, (idx if idx is not None and not idx.empty else None), "야후 파이낸스 5분봉"
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_daily(code: str, idx_sym: str, days: int):
     """미국 종목: 일봉 종목·지수 시세를 동시에 받아 온다 (주식002와 같음)"""
@@ -411,7 +443,7 @@ def page():
     US = is_us(code)                                  # 미국 종목 여부
     DEC = 2 if US else 0                              # 가격 소수 자릿수 (미국 $187.45 / 국내 71,500)
     CUR = "$" if US else ""
-    BAR_LBL = "일봉" if US else f"{BAR_MIN}분봉"       # 국내 = 실시간 5분봉, 미국 = 일봉(주식002와 같음)
+    BAR_LBL = f"{BAR_MIN}분봉"                         # 시세를 받은 뒤 다시 정함 (미국 5분봉 실패 시 일봉)
 
     def px(v) -> str:
         return f"{CUR}{v:,.{DEC}f}"
@@ -437,15 +469,25 @@ def page():
         idx_sym, idx_name = ("IXIC", "나스닥") if mkt == "NASDAQ" else ("US500", "S&P500")
     else:       # 국내: 네이버 지수 분봉
         idx_sym, idx_name = ("KOSDAQ", "코스닥") if mkt == "KOSDAQ" else ("KOSPI", "코스피")
+    us_err = ""
     try:
         if US:
-            df, _idf, data_src = load_daily(code.strip(), idx_sym, calc)
+            try:                                   # 미국: 야후 5분봉 → 안 되면 주식002처럼 일봉
+                df, _idf, data_src = load_us5(code.strip(), idx_sym, calc)
+                if len(df) < 60:
+                    raise ValueError(f"5분봉 {len(df)}개뿐")
+            except Exception as e5:
+                us_err = str(e5)[:80]
+                df, _idf, data_src = load_daily(code.strip(), idx_sym, calc)
         else:
             df, _idf, data_src = load_both(code.strip(), idx_sym, calc)
     except Exception as e:
         status.empty()
         st.error(f"데이터를 불러오지 못했습니다: {e}")
         st.stop()
+    INTRA = not (US and data_src.endswith("일봉"))    # True = 5분봉, False = 일봉(미국 5분봉 실패 시)
+    BAR_LBL = f"{BAR_MIN}분봉" if INTRA else "일봉"
+    badge = badge.replace(f">{BAR_MIN}분봉<", f">{BAR_LBL}<")
     if df.empty or len(df) < 60:
         status.empty()
         st.warning(f"{BAR_LBL} 데이터가 부족합니다(60개 이상 필요, 받은 개수 {len(df)}개). 종목코드를 확인하세요.")
@@ -470,7 +512,13 @@ def page():
     D = n
     init_span = int(min(disp, D))
     sl = slice(n - D, n)
-    dates = df.index.strftime("%Y-%m-%d" if US else "%Y-%m-%d %H:%M")[sl]
+    if not INTRA:
+        dates = df.index.strftime("%Y-%m-%d")[sl]
+    elif US:    # 미국 5분봉: 한국시간으로 표시 (예: 뉴욕 09:30 → 한국 23:30)
+        dates = df.index.tz_localize("America/New_York").tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M")[sl]
+    else:
+        dates = df.index.strftime("%Y-%m-%d %H:%M")[sl]
+    sess = df.index.strftime("%Y-%m-%d")[sl]         # 거래일(미국은 뉴욕 날짜) — 날짜 구분선·전일 종가용
     yv, curvev, upv, lov = y[sl], curve[sl], upper[sl], lower[sl]
     def _ohl(c):   # 시가·고가·저가가 비어 있으면 종가로 대신 채움
         a = df[c].to_numpy(dtype=float)[sl] if c in df.columns else yv.copy()
@@ -499,23 +547,28 @@ def page():
     # 등락은 증권사 앱처럼 '전일 종가' 대비, 거래량은 오늘 누적
     _day = df.index.normalize()
     _today = _day[-1]
-    _prev_days = df.iloc[:-1] if US else df[_day < _today]
+    _prev_days = df.iloc[:-1] if not INTRA else df[_day < _today]
     last = y[-1]
     prev = float(_prev_days["Close"].iloc[-1]) if not _prev_days.empty else float(df["Open"][_day == _today].iloc[0])
     chg = last - prev
     pct = chg / prev * 100
     col = "#e5484d" if chg > 0 else ("#3b6fd4" if chg < 0 else "#333333")
     arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "-")
-    vol = df["Volume"].iloc[-1] if US else df["Volume"][_day == _today].sum()
+    vol = df["Volume"].iloc[-1] if not INTRA else df["Volume"][_day == _today].sum()
 
     # ───────────── 종목명 옆: 기준 시각 + 지수 ─────────────
+    if idx_arr is None:
+        name_ph.markdown(
+            f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
+            f'<span style="font-size:13px;color:#888;font-weight:400">{code_tag}</span> {badge}</div>',
+            unsafe_allow_html=True)
     if idx_arr is not None:
         name_ph.markdown(
             f'<div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap">'
             f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
             f'<span style="font-size:13px;color:#888;font-weight:400">{code_tag}</span> {badge}</div>'
             f'<div style="font-size:17px;font-weight:700;color:#0aa05a">'
-            f'● {df.index[-1].strftime("%Y-%m-%d" if US else "%Y-%m-%d %H:%M")} {idx_name} {idx_arr[-1]:,.2f}</div>'
+            f'● {dates[-1]}{" (한국시간)" if US and INTRA else ""} {idx_name} {idx_arr[-1]:,.2f}</div>'
             '</div>',
             unsafe_allow_html=True)
 
@@ -549,7 +602,7 @@ def page():
         '<div>'
         f'<div class="hd-px"><span class="hd-big" style="color:{col}">{px(last)}</span>'
         f'<span class="hd-chg" style="color:{col}">{arrow} {abs(chg):,.{DEC}f} &nbsp; {pct:+.2f}%</span></div>'
-        f'<div style="font-size:13px;color:#888;margin-top:6px">{'거래량' if US else '오늘 거래량'} {vol:,.0f}</div>'
+        f'<div style="font-size:13px;color:#888;margin-top:6px">{'거래량' if not INTRA else '오늘 거래량'} {vol:,.0f}</div>'
         '</div>'
         '<div class="hd-lines">'
         f'<div class="hd-lbl" data-ul="1" style="color:#1a56db;font-weight:600">매도선<br>(<span data-k="u">{_up:,.{DEC}f}</span>)</div>'
@@ -884,7 +937,7 @@ def page():
         pos = sorted({m - 1 - int(round(i * (m - 1) / 3.6)) for i in range(4)})
         fig.update_xaxes(type="category", tickmode="array",
                          tickvals=[dates[i] for i in pos],
-                         ticktext=[pd.to_datetime(dates[i]).strftime("%m.%d" if US else "%m.%d %H:%M") for i in pos],
+                         ticktext=[pd.to_datetime(dates[i]).strftime("%m.%d" if not INTRA else "%m.%d %H:%M") for i in pos],
                          tickangle=0, tickfont=dict(size=11, color="#555"),
                          showgrid=True, gridcolor="#f0b8b8", gridwidth=1,
                          showline=False, zeroline=False)
@@ -894,8 +947,8 @@ def page():
                          showgrid=True, gridcolor="#eeeeee", zeroline=False, showline=False, ticks="")
         fig.update_yaxes(nticks=4, row=2, col=1)
         # 날짜가 바뀌는 곳에 옅은 세로 점선 (어디서부터 오늘인지 쉽게 구분)
-        for i in (range(1, m) if not US else ()):     # 일봉(미국)은 매일 바뀌므로 생략
-            if dates[i][:10] != dates[i - 1][:10]:
+        for i in (range(1, m) if INTRA else ()):      # 일봉은 매일 바뀌므로 생략
+            if sess[i] != sess[i - 1]:
                 fig.add_shape(type="line", xref="x", yref="paper", x0=i - 0.5, x1=i - 0.5, y0=0, y1=1,
                               line=dict(color="#bbbbbb", width=1, dash="dot"), layer="below")
         tagc = "#e5484d" if chg > 0 else "#3b6fd4"
@@ -957,14 +1010,16 @@ def page():
         if st.button("🔄 새로고침", use_container_width=True):   # 1분마다 자동으로 새 시세를 받지만, 바로 받고 싶을 때
             load_both.clear()
             load_daily.clear()
+            load_us5.clear()
             st.rerun()
     with _c2:
         _now = pd.Timestamp.now(tz="Asia/Seoul")
         _auto_txt = f"{REFRESH_SEC}초마다 자동 갱신 (마지막 {_now:%H:%M:%S})" if _frag else "자동 갱신 안 됨: streamlit 업데이트 필요"
-        if US:
-            st.caption(f"미국 종목은 일봉으로 표시합니다 (주식002와 같음) · 기준 {df.index[-1]:%Y-%m-%d} · 데이터: {data_src}")
+        if not INTRA:
+            st.caption(f"미국 5분봉을 받지 못해 일봉으로 표시합니다 ({us_err}) · 기준 {df.index[-1]:%Y-%m-%d} · 데이터: {data_src}")
         else:
-            st.caption(f"기준 {df.index[-1]:%m-%d %H:%M} · {BAR_LBL} {n}개로 계산 · 데이터: {data_src} · {_auto_txt}")
+            _tz = " (한국시간)" if US else ""
+            st.caption(f"기준 {dates[-1][5:]}{_tz} · {BAR_LBL} {n}개로 계산 · 데이터: {data_src} · {_auto_txt}")
     st.session_state.loaded = code
 
 
