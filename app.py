@@ -8,9 +8,10 @@ import json
 import html
 from concurrent.futures import ThreadPoolExecutor
 import re
+import requests
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="추세전환/사이클 차트", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="추세전환 차트 (5분봉)", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
 .block-container{padding:0.8rem 0.4rem 1rem 0.4rem;max-width:100%;}
 header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],footer,
@@ -18,7 +19,12 @@ header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecora
 </style>""", unsafe_allow_html=True)
 
 # ───────────── 차트 계산 설정(고정값) ─────────────
+# 일봉 버전(주식001)과 같은 값을 "봉 개수" 기준으로 그대로 사용
+#   표시 120봉(약 1.5일) · 계산 720봉(약 9거래일) · λ 8,000 · σ 배수 1.6
 disp, calc, lam, kmul, band_pct = 120, 720, 8e3, 1.6, 0.0
+BAR_MIN = 5               # 분봉 단위(분)
+FETCH_DAYS = 16           # 분봉을 받아올 달력 기간(일) — 720봉(약 9거래일)을 채우기 위해 여유 있게
+REGULAR_ONLY = True       # True = 정규장(09:00~15:30)만 사용 (NXT 시간외 거래 제외)
 DEFAULT_CODE = "278530"   # 처음 열 때 보여줄 종목: KODEX 200TR
 
 
@@ -39,37 +45,6 @@ WORDS = {
     "kt": "케이티", "cj": "씨제이", "gs": "지에스", "kb": "케이비", "db": "디비", "ls": "엘에스",
 }
 PHRASES = {r"s-oil": "에쓰오일"}
-
-# ───────────── 미국 주식: 한글 이름으로도 찾을 수 있게 (티커: (한글이름, 거래소)) ─────────────
-# 거래소가 NASDAQ이면 나스닥 지수, 그 밖(NYSE 등)이면 S&P500 지수와 비교
-US_KO = {
-    "AAPL": ("애플", "NASDAQ"), "MSFT": ("마이크로소프트", "NASDAQ"), "NVDA": ("엔비디아", "NASDAQ"),
-    "AMZN": ("아마존", "NASDAQ"), "GOOGL": ("알파벳A 구글", "NASDAQ"), "GOOG": ("알파벳C 구글", "NASDAQ"),
-    "META": ("메타 페이스북", "NASDAQ"), "TSLA": ("테슬라", "NASDAQ"), "AVGO": ("브로드컴", "NASDAQ"),
-    "AMD": ("에이엠디", "NASDAQ"), "NFLX": ("넷플릭스", "NASDAQ"), "INTC": ("인텔", "NASDAQ"),
-    "QCOM": ("퀄컴", "NASDAQ"), "MU": ("마이크론", "NASDAQ"), "ASML": ("에이에스엠엘", "NASDAQ"),
-    "ADBE": ("어도비", "NASDAQ"), "CSCO": ("시스코", "NASDAQ"), "PEP": ("펩시코", "NASDAQ"),
-    "COST": ("코스트코", "NASDAQ"), "SBUX": ("스타벅스", "NASDAQ"), "PLTR": ("팔란티어", "NASDAQ"),
-    "PYPL": ("페이팔", "NASDAQ"), "ARM": ("암홀딩스", "NASDAQ"), "SMCI": ("슈퍼마이크로컴퓨터", "NASDAQ"),
-    "MSTR": ("마이크로스트래티지", "NASDAQ"), "COIN": ("코인베이스", "NASDAQ"), "ABNB": ("에어비앤비", "NASDAQ"),
-    "RIVN": ("리비안", "NASDAQ"), "LCID": ("루시드", "NASDAQ"), "QQQ": ("나스닥100 ETF", "NASDAQ"),
-    "TQQQ": ("나스닥100 3배 ETF", "NASDAQ"), "SOXL": ("반도체 3배 ETF", "NASDAQ"),
-    "IONQ": ("아이온큐", "NYSE"), "TSM": ("TSMC 대만반도체", "NYSE"), "BRK-B": ("버크셔해서웨이", "NYSE"),
-    "JPM": ("제이피모건", "NYSE"), "V": ("비자", "NYSE"), "MA": ("마스터카드", "NYSE"),
-    "KO": ("코카콜라", "NYSE"), "DIS": ("디즈니", "NYSE"), "NKE": ("나이키", "NYSE"),
-    "MCD": ("맥도날드", "NYSE"), "WMT": ("월마트", "NYSE"), "JNJ": ("존슨앤드존슨", "NYSE"),
-    "PFE": ("화이자", "NYSE"), "LLY": ("일라이릴리", "NYSE"), "NVO": ("노보노디스크", "NYSE"),
-    "XOM": ("엑슨모빌", "NYSE"), "BA": ("보잉", "NYSE"), "ORCL": ("오라클", "NYSE"),
-    "CRM": ("세일즈포스", "NYSE"), "IBM": ("아이비엠", "NYSE"), "UBER": ("우버", "NYSE"),
-    "BABA": ("알리바바", "NYSE"), "SPY": ("S&P500 ETF", "NYSE"), "VOO": ("뱅가드 S&P500 ETF", "NYSE"),
-    "SCHD": ("슈왑 배당 ETF", "NYSE"),
-}
-US_MKTS = ("NASDAQ", "NYSE", "AMEX", "US")
-
-
-def is_us(code: str) -> bool:
-    """한국 종목코드는 숫자로 시작(005930, 0091C0), 미국 티커는 영문으로 시작(AAPL)"""
-    return bool(code) and code[0].isalpha()
 
 
 def norm(t) -> str:
@@ -94,53 +69,25 @@ def to_ko(name: str) -> str:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def listing() -> pd.DataFrame:
-    """종목명 검색용 목록 (국내 주식 + 국내 ETF + 미국 나스닥·뉴욕·아멕스 + 미국 ETF)"""
-    # (목록 이름, 거래소 표시) — 국내는 목록 안의 Market 값으로 코스피/코스닥을 나눔
-    SOURCES = (("KRX", ""), ("ETF/KR", "ETF"), ("NASDAQ", "NASDAQ"), ("NYSE", "NYSE"),
-               ("AMEX", "AMEX"), ("ETF/US", "US"))
-
-    def one(src):
-        market, label = src
+    """종목명 검색용 목록 (주식 + ETF)"""
+    def one(market):
         try:
             d = fdr.StockListing(market)
             cc = "Code" if "Code" in d.columns else "Symbol"
             d = d.rename(columns={cc: "Code"})
-            if label in US_MKTS or "Market" not in d.columns:
-                d["Market"] = label
+            d["Market"] = d["Market"] if "Market" in d.columns else ("ETF" if market == "ETF/KR" else "")
             return d[["Code", "Name", "Market"]]
         except Exception:
             return None
-    ex = ThreadPoolExecutor(max_workers=len(SOURCES))             # 목록을 동시에 받아 대기 시간 단축
-    futs = [ex.submit(one, s) for s in SOURCES]
-    frames = []
-    for f in futs:
-        try:
-            r = f.result(timeout=25)                               # 한 목록이 늦어도 나머지는 사용
-            if r is not None:
-                frames.append(r)
-        except Exception:
-            pass
-    ex.shutdown(wait=False)
-    # 자주 찾는 미국 종목은 목록을 못 받아도 항상 검색되게 추가
-    frames.append(pd.DataFrame([(k, k, v[1]) for k, v in US_KO.items()], columns=["Code", "Name", "Market"]))
-    out = pd.concat(frames).dropna().reset_index(drop=True)
-    out["Code"] = out["Code"].astype(str).str.strip().str.replace(".", "-", regex=False)   # BRK.B → BRK-B
-    out = out.drop_duplicates("Code").reset_index(drop=True)      # 먼저 받은 목록(실제 회사명)을 우선 사용
-
-    def mk(x):
-        x = str(x).upper()
-        if x in US_MKTS:
-            return x
-        return "KOSDAQ" if "KOSDAQ" in x else "KOSPI"
-    out["mkt"] = out["Market"].map(mk)
-    for k, (ko, m) in US_KO.items():                               # 거래소를 확실히 아는 종목은 고정
-        out.loc[out["Code"] == k, "mkt"] = m
-    out["ko"] = out["Code"].map(lambda c: US_KO.get(c, ("",))[0])   # 미국 종목 한글 이름
-    us = out["mkt"].isin(US_MKTS)
+    with ThreadPoolExecutor(max_workers=2) as ex:                  # 두 목록을 동시에 받아 대기 시간 단축
+        frames = [f for f in ex.map(one, ("KRX", "ETF/KR")) if f is not None]
+    if not frames:
+        return pd.DataFrame(columns=["Code", "Name", "nn", "nk", "mkt"])
+    out = pd.concat(frames).dropna().drop_duplicates("Code").reset_index(drop=True)
+    out["Code"] = out["Code"].astype(str)
+    out["mkt"] = out["Market"].astype(str).str.upper().map(lambda x: "KOSDAQ" if "KOSDAQ" in x else "KOSPI")
     out["nn"] = out["Name"].map(norm)                       # 원래 이름(정규화)
     out["nk"] = out["Name"].map(lambda x: norm(to_ko(x)))   # 한글 발음 이름(정규화)
-    out.loc[us, "nk"] = [norm(k) if k else n for k, n in zip(out.loc[us, "ko"], out.loc[us, "nn"])]
-    out["disp"] = [f"{k} {nm}" if k and k != nm else nm for k, nm in zip(out["ko"], out["Name"])]
     return out
 
 
@@ -149,8 +96,7 @@ def search(lst: pd.DataFrame, q: str):
     nq, nqk = norm(q), norm(to_ko(q))
     if not nq or lst.empty:
         return "none", lst.iloc[0:0]
-    qc = q.strip().upper().replace(".", "-")
-    exact = lst[(lst["nn"] == nq) | (lst["nk"] == nq) | (lst["nk"] == nqk) | (lst["Code"] == qc)]
+    exact = lst[(lst["nn"] == nq) | (lst["nk"] == nq) | (lst["nk"] == nqk)]
     if len(exact) == 1:
         return "exact", exact
     m = exact
@@ -171,39 +117,29 @@ if "code" not in st.session_state:
     st.session_state.code = DEFAULT_CODE
 
 name_ph = st.empty()
-q = st.text_input("종목 검색", placeholder="🔍 종목코드·종목명 (예: 삼성전자, 278530, 애플, AAPL, 테슬라)",
+q = st.text_input("종목 검색", placeholder="🔍 종목코드 또는 종목명 (예: 278530, 삼성전자, 네이버)",
                   label_visibility="collapsed").strip()
 # 종목 목록은 검색할 때(또는 다른 종목을 보고 있을 때)만 불러온다 → 처음 화면이 바로 뜸
 if q or st.session_state.code != DEFAULT_CODE:
-    with st.spinner("종목 목록(국내·미국)을 불러오는 중입니다… 처음 한 번은 조금 걸릴 수 있어요"):
+    with st.spinner("종목 목록을 불러오는 중입니다…"):
         lst = listing()
 else:
-    lst = pd.DataFrame(columns=["Code", "Name", "nn", "nk", "mkt", "disp"])
-names = dict(zip(lst["Code"], lst["disp"]))
-mkts = dict(zip(lst["Code"], lst["mkt"]))        # 코스피/코스닥/나스닥/뉴욕 구분 (국내 ETF는 코스피로 처리)
+    lst = pd.DataFrame(columns=["Code", "Name", "nn", "nk", "mkt"])
+names = dict(zip(lst["Code"], lst["Name"]))
+mkts = dict(zip(lst["Code"], lst["mkt"]))        # 코스피/코스닥 구분 (ETF는 코스피로 처리)
 names.setdefault(DEFAULT_CODE, "KODEX 200TR")   # 종목 목록 없이도 기본 종목 이름 표시
-for _k, (_ko, _m) in US_KO.items():             # 목록을 못 받아도 인기 미국 종목은 한글 이름 표시
-    names.setdefault(_k, _ko)
-    mkts.setdefault(_k, _m)
-MKT_KO = {"NASDAQ": "나스닥", "NYSE": "뉴욕", "AMEX": "아멕스", "US": "미국"}
 if q:
-    qu = q.upper().replace(".", "-")
-    if len(q) == 6 and q.isdigit():
-        st.session_state.code = qu                                  # 국내 6자리 종목코드 → 바로 표시
+    qu = q.upper()
+    if qu in names or (len(q) == 6 and q.isdigit()):
+        st.session_state.code = qu                                  # 종목코드 → 바로 표시
     elif lst.empty:
-        if re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", qu):               # 목록이 없어도 미국 티커는 바로 시도
-            st.session_state.code = qu
-        else:
-            st.caption("종목 목록을 불러오지 못했습니다. 6자리 종목코드나 미국 티커(예: AAPL)로 검색해 주세요.")
+        st.caption("종목 목록을 불러오지 못했습니다. 6자리 종목코드로 검색해 주세요.")
     else:
         kind, m = search(lst, q)
-        if kind == "none" and re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", qu):
-            st.session_state.code = qu                              # 목록에 없는 미국 티커도 바로 시도
-        elif kind == "exact":                                       # 이름·코드가 정확히 맞으면 바로 표시
+        if kind == "exact":                                         # 이름이 정확히 맞으면 바로 표시
             st.session_state.code = m.iloc[0]["Code"]
         elif kind == "list":                                        # 일부만 입력 → 연관 종목에서 선택
-            opts = [f"{r.disp}{' · ' + MKT_KO[r.mkt] if r.mkt in MKT_KO else ''} ({r.Code})"
-                    for r in m.head(30).itertuples()]
+            opts = [f"{r.Name} ({r.Code})" for r in m.head(30).itertuples()]
             sel = st.selectbox("연관 종목", opts, index=None, key=f"sel_{norm(q)}",
                                placeholder=f"연관 종목 {len(m)}개 — 여기서 선택", label_visibility="collapsed")
             if sel:
@@ -212,19 +148,10 @@ if q:
             st.caption("검색 결과가 없습니다.")
 code = st.session_state.code
 name = names.get(code, code)
-US = is_us(code)                                  # 미국 종목 여부
-DEC = 2 if US else 0                              # 가격 소수 자릿수 (미국 $187.45 / 국내 71,500)
-CUR = "$" if US else ""
-
-
-def px(v) -> str:
-    return f"{CUR}{v:,.{DEC}f}"
-
-
-code_tag = html.escape(code) + (f" · {MKT_KO.get(mkts.get(code, 'US'), '미국')}" if US else "")
 name_ph.markdown(
     f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
-    f'<span style="font-size:13px;color:#888;font-weight:400">{code_tag}</span></div>',
+    f'<span style="font-size:13px;color:#888;font-weight:400">{html.escape(code)}</span> '
+    f'<span style="font-size:12px;color:#fff;background:#555;border-radius:4px;padding:1px 5px;font-weight:600">{BAR_MIN}분봉</span></div>',
     unsafe_allow_html=True)
 
 # 시세를 받는 동안 "고장난 것처럼" 보이지 않도록 안내 표시 (차트가 나오면 사라짐)
@@ -234,40 +161,157 @@ status.markdown(
     '⏳ 시세를 불러오는 중입니다. 처음 한 번은 20~30초 걸릴 수 있어요. 잠시만 기다려 주세요.</div>',
     unsafe_allow_html=True)
 
-@st.cache_data(ttl=30, show_spinner=False)
-def live_index(sym: str):
-    """네이버에서 지수 현재값(장중이면 실시간, 장 마감 후엔 종가)을 받는다. 실패하면 None (국내 지수만)"""
-    if sym not in ("KS11", "KQ11"):
-        return None
-    import requests
+# ───────────── 5분봉 시세 받기 (네이버 1분봉 → 5분봉으로 묶음) ─────────────
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      "Referer": "https://m.stock.naver.com/"}
+COLS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def _num(v):
     try:
-        r = requests.get(f"https://m.stock.naver.com/api/index/{'KOSDAQ' if sym == 'KQ11' else 'KOSPI'}/basic",
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
-        j = r.json()
-        val = float(str(j["closePrice"]).replace(",", ""))
-        day = pd.Timestamp(str(j.get("localTradedAt", ""))[:10]).normalize()
-        return day, val
+        f = float(str(v).replace(",", ""))
+        return f if np.isfinite(f) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _to_ts(s):
+    s = re.sub(r"\D", "", str(s))
+    fmt = {14: "%Y%m%d%H%M%S", 12: "%Y%m%d%H%M"}.get(len(s))
+    return pd.to_datetime(s, format=fmt, errors="coerce") if fmt else pd.NaT
+
+
+def _frame(rows, cum_vol=False):
+    """[(시각, 시가, 고가, 저가, 종가, 거래량), ...] → 시각 인덱스 DataFrame"""
+    if not rows:
+        return pd.DataFrame(columns=COLS)
+    d = pd.DataFrame(rows, columns=["t"] + COLS)
+    d["t"] = d["t"].map(_to_ts)
+    d = d.dropna(subset=["t", "Close"]).drop_duplicates("t", keep="last").set_index("t").sort_index()
+    d = d[d["Close"] > 0]
+    if d.empty:
+        return d
+    for c in ("Open", "High", "Low"):                      # 비어 있으면 종가로 채움
+        d[c] = d[c].where(d[c] > 0, d["Close"])
+    d["Volume"] = d["Volume"].fillna(0)
+    if cum_vol:                                             # 누적 거래량 → 1분 거래량
+        d["Volume"] = d.groupby(d.index.date)["Volume"].diff().fillna(d["Volume"]).clip(lower=0)
+    return d
+
+
+def _naver_api(kind, sym, d0, d1):
+    """① api.stock.naver.com 분봉 (kind = 'item' 종목 / 'index' 지수)"""
+    r = requests.get(f"https://api.stock.naver.com/chart/domestic/{kind}/{sym}/minute",
+                     params={"startDateTime": d0.strftime("%Y%m%d") + "0000",
+                             "endDateTime": d1.strftime("%Y%m%d") + "2359"},
+                     headers=UA, timeout=6)
+    j = r.json()
+    if isinstance(j, dict):
+        j = j.get("priceInfos") or j.get("chartInfos") or j.get("result") or []
+    rows, cum = [], False
+    for o in j:
+        k = {str(a).lower(): b for a, b in o.items()}
+        if "tradingvolume" in k:
+            v = k["tradingvolume"]
+        else:
+            v, cum = k.get("accumulatedtradingvolume"), True
+        rows.append((k.get("localdatetime") or k.get("datetime") or k.get("localdate"),
+                     _num(k.get("openprice")), _num(k.get("highprice")), _num(k.get("lowprice")),
+                     _num(k.get("currentprice", k.get("closeprice"))), _num(v)))
+    return _frame(rows, cum)
+
+
+def _naver_sisejson(sym, d0, d1):
+    """② fchart siseJson 분봉"""
+    r = requests.get("https://fchart.stock.naver.com/siseJson.nhn",
+                     params={"symbol": sym, "requestType": 1, "timeframe": "minute",
+                             "startTime": d0.strftime("%Y%m%d"), "endTime": d1.strftime("%Y%m%d")},
+                     headers=UA, timeout=8)
+    rows = []
+    for t, rest in re.findall(r'\[\s*["\'](\d{12,14})["\']\s*,([^\]]*)\]', r.text):
+        v = [_num(x.strip()) for x in rest.split(",")] + [np.nan] * 5
+        rows.append((t, v[0], v[1], v[2], v[3], v[4]))
+    return _frame(rows, cum_vol=True)
+
+
+def _naver_xml(sym, count):
+    """③ fchart sise.nhn 분봉 (종가만 있는 경우도 있음)"""
+    r = requests.get("https://fchart.stock.naver.com/sise.nhn",
+                     params={"symbol": sym, "timeframe": "minute", "count": count, "requestType": 0},
+                     headers=UA, timeout=8)
+    rows = []
+    for s in re.findall(r'data="([^"]+)"', r.text):
+        p = s.split("|") + [""] * 6
+        rows.append((p[0], _num(p[1]), _num(p[2]), _num(p[3]), _num(p[4]), _num(p[5])))
+    return _frame(rows, cum_vol=True)
+
+
+def minute1(kind, sym, days):
+    """1분봉 받기: ①한 번에 → ①하루씩 동시에 → ② → ③ 순서로 시도. (DataFrame, 출처) 반환"""
+    end = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
+    start = end - pd.Timedelta(days=days)
+    try:
+        d = _naver_api(kind, sym, start, end)
+        if len(set(d.index.date)) >= 3:
+            return d, "네이버 분봉 API"
+    except Exception:
+        d = pd.DataFrame(columns=COLS)
+    try:
+        wd = [x for x in pd.date_range(start, end) if x.weekday() < 5]
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            parts = list(ex.map(lambda x: _safe(_naver_api, kind, sym, x, x), wd))
+        parts = [p for p in parts if p is not None and not p.empty]
+        if parts:
+            dd = pd.concat(parts)
+            dd = dd[~dd.index.duplicated(keep="last")].sort_index()
+            if len(dd) > len(d):
+                d = dd
+        if not d.empty:
+            return d, "네이버 분봉 API(일자별)"
+    except Exception:
+        pass
+    for f, args, src in ((_naver_sisejson, (sym, start, end), "네이버 fchart(JSON)"),
+                         (_naver_xml, (sym, int(days * 400)), "네이버 fchart(XML)")):
+        d = _safe(f, *args)
+        if d is not None and not d.empty:
+            return d, src
+    return pd.DataFrame(columns=COLS), "없음"
+
+
+def _safe(f, *a):
+    try:
+        return f(*a)
     except Exception:
         return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_both(code: str, idx_sym: str, days: int):
-    """종목과 지수 시세를 동시에 받아 온다. 지수는 8초 안에 못 받으면 None(차트는 지수선 없이 표시)"""
-    start = (pd.Timestamp.today() - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y-%m-%d")
-    ex = ThreadPoolExecutor(max_workers=2)
-    f_stock = ex.submit(fdr.DataReader, code.replace(".", "-"), start)
-    f_idx = ex.submit(fdr.DataReader, idx_sym, start)
-    try:
-        stock = f_stock.result(timeout=40).tail(int(days))
-        try:
-            idx = f_idx.result(timeout=8).tail(int(days))
-        except Exception:
-            idx = None
-        return stock, idx
-    finally:
-        ex.shutdown(wait=False)
+def to_bars(m1: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """1분봉 → N분봉 (봉 시각 = 시작 시각, 예: 09:00 봉 = 09:00~09:04)"""
+    if m1.empty:
+        return m1
+    d = m1.copy()
+    # 시각이 '끝난 시각'(첫 봉 09:01)으로 오면 1분 당겨서 시작 시각으로 맞춤
+    firsts = pd.Series(d.index).groupby(pd.Series(d.index).dt.date).min().dt.strftime("%H:%M")
+    if (firsts == "09:00").sum() == 0 and (firsts == "09:01").sum() > 0:
+        d.index = d.index - pd.Timedelta(minutes=1)
+    if REGULAR_ONLY:
+        hm = d.index.hour * 100 + d.index.minute
+        d = d[(hm >= 900) & (hm <= 1530)]
+    b = d.resample(f"{minutes}min", label="left", closed="left").agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+    return b.dropna(subset=["Close"])
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_both(code: str, idx_sym: str, bars: int):
+    """종목과 지수의 5분봉을 동시에 받아 온다. 지수는 실패하면 None(차트는 지수선 없이 표시)"""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_s = ex.submit(minute1, "item", code, FETCH_DAYS)
+        f_i = ex.submit(minute1, "index", idx_sym, FETCH_DAYS)
+        (s1, src), (i1, _) = f_s.result(), _safe(f_i.result) or (pd.DataFrame(columns=COLS), "")
+    stock = to_bars(s1, BAR_MIN).tail(int(bars))
+    idx = to_bars(i1, BAR_MIN) if not i1.empty else None
+    return stock, idx, src
 
 def hp_trend(z: np.ndarray, lam: float) -> np.ndarray:
     """Hodrick-Prescott 필터의 추세 성분: (I + λ D'D) τ = z"""
@@ -279,20 +323,17 @@ def hp_trend(z: np.ndarray, lam: float) -> np.ndarray:
 
 
 calc = max(int(calc), 180)
-mkt = mkts.get(code, "NASDAQ" if US else "KOSPI")
-if US:      # 미국: 나스닥 상장 → 나스닥 종합지수, 그 밖(뉴욕 등) → S&P500
-    idx_sym, idx_name = ("IXIC", "나스닥") if mkt == "NASDAQ" else ("US500", "S&P500")
-else:
-    idx_sym, idx_name = ("KQ11", "코스닥") if mkt == "KOSDAQ" else ("KS11", "코스피")
+mkt = mkts.get(code, "KOSPI")
+idx_sym, idx_name = ("KOSDAQ", "코스닥") if mkt == "KOSDAQ" else ("KOSPI", "코스피")
 try:
-    df, _idf = load_both(code.strip(), idx_sym, calc)
+    df, _idf, data_src = load_both(code.strip(), idx_sym, calc)
 except Exception as e:
     status.empty()
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
 if df.empty or len(df) < 60:
     status.empty()
-    st.warning("데이터가 부족합니다(60개 이상 필요). 종목코드를 확인하세요.")
+    st.warning(f"{BAR_MIN}분봉 데이터가 부족합니다(60개 이상 필요, 받은 개수 {len(df)}개). 종목코드를 확인하세요.")
     st.stop()
 
 y = df["Close"].to_numpy(dtype=float)
@@ -310,11 +351,11 @@ sd_rel = rel.std()
 width = band_pct / 100 if band_pct > 0 else kmul * sd_rel
 upper, lower = curve * (1 + width), curve * (1 - width)
 
-# 화면에는 최근 disp일만 표시
+# 화면에는 최근 disp봉만 표시
 D = n
 init_span = int(min(disp, D))
 sl = slice(n - D, n)
-dates = df.index.strftime("%Y-%m-%d")[sl]
+dates = df.index.strftime("%Y-%m-%d %H:%M")[sl]
 yv, curvev, upv, lov = y[sl], curve[sl], upper[sl], lower[sl]
 def _ohl(c):   # 시가·고가·저가가 비어 있으면 종가로 대신 채움
     a = df[c].to_numpy(dtype=float)[sl] if c in df.columns else yv.copy()
@@ -324,46 +365,43 @@ hv, lv = np.maximum.reduce([hv, ov, yv]), np.minimum.reduce([lv, ov, yv])
 
 # ───────────── 지수(코스피/코스닥) 비교선 ─────────────
 idx_arr = None
-_live_ok = False
 try:
-    _s = _idf["Close"].reindex(df.index).ffill().bfill()
-    _live = live_index(idx_sym)                 # 종목처럼 접속할 때마다 최신 지수값으로 갱신
-    if _live is not None and _live[0] >= df.index[-1].normalize():
-        _s.iloc[-1] = _live[1]
-        _live_ok = True
-    if len(_s) == n and np.isfinite(_s.to_numpy(dtype=float)).all():
-        idx_arr = _s.to_numpy(dtype=float)
+    if _idf is not None and not _idf.empty:
+        _s = _idf["Close"].reindex(df.index.union(_idf.index)).sort_index().ffill().reindex(df.index).bfill()
+        if len(_s) == n and np.isfinite(_s.to_numpy(dtype=float)).all():
+            idx_arr = _s.to_numpy(dtype=float)
 except Exception:
     idx_arr = None
-idx_note = ""
-if idx_arr is not None:     # 지수 데이터가 종목보다 며칠 일찍 끝나면 알려줌 (마지막 값으로 채워졌다는 뜻)
-    _gap = (df.index.max() - _idf.index.max()).days
-    if _gap >= 1 and not _live_ok:
-        idx_note = f"※ {idx_name} 데이터가 {_idf.index.max():%Y-%m-%d}까지만 있어 최근 {_gap}일은 마지막 값으로 채웠습니다."
 idx_scaled = None
 if idx_arr is not None:     # 처음 열었을 때 맨 왼쪽 종가에 한 번만 맞춘 뒤 고정 (밀거나 확대해도 변하지 않음)
     idx_scaled = idx_arr * (yv[n - init_span] / idx_arr[n - init_span])
 PHONE_SPAN_PY = min(42, init_span)
 idx_scaled_p = None
-if idx_scaled is not None:  # 폰은 처음 2달치만 보이므로 그 맨 왼쪽 종가에 맞춘 지수선도 따로 준비
+if idx_scaled is not None:  # 폰은 처음 42봉(약 3시간 반)만 보이므로 그 맨 왼쪽 종가에 맞춘 지수선도 따로 준비
     idx_scaled_p = idx_arr * (yv[n - PHONE_SPAN_PY] / idx_arr[n - PHONE_SPAN_PY])
 
 # ───────────── 상단 시세 헤더 ─────────────
-last, prev = y[-1], y[-2]
+# 등락은 증권사 앱처럼 '전일 종가' 대비, 거래량은 오늘 누적
+_day = df.index.normalize()
+_today = _day[-1]
+_prev_days = df[_day < _today]
+last = y[-1]
+prev = float(_prev_days["Close"].iloc[-1]) if not _prev_days.empty else float(df["Open"][_day == _today].iloc[0])
 chg = last - prev
 pct = chg / prev * 100
 col = "#e5484d" if chg > 0 else ("#3b6fd4" if chg < 0 else "#333333")
 arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "-")
-vol = df["Volume"].iloc[-1]
+vol = df["Volume"][_day == _today].sum()
 
-# ───────────── 종목명 옆: 기준 날짜 + 지수 ─────────────
+# ───────────── 종목명 옆: 기준 시각 + 지수 ─────────────
 if idx_arr is not None:
     name_ph.markdown(
         f'<div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap">'
         f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
-        f'<span style="font-size:13px;color:#888;font-weight:400">{html.escape(code)}</span></div>'
+        f'<span style="font-size:13px;color:#888;font-weight:400">{html.escape(code)}</span> '
+        f'<span style="font-size:12px;color:#fff;background:#555;border-radius:4px;padding:1px 5px;font-weight:600">{BAR_MIN}분봉</span></div>'
         f'<div style="font-size:17px;font-weight:700;color:#0aa05a">'
-        f'● {df.index[-1]:%Y-%m-%d} {idx_name} {idx_arr[-1]:,.2f}</div>'
+        f'● {df.index[-1]:%Y-%m-%d %H:%M} {idx_name} {idx_arr[-1]:,.2f}</div>'
         '</div>',
         unsafe_allow_html=True)
 
@@ -395,13 +433,13 @@ st.markdown(
     '</style>'
     '<div class="hd-row">'
     '<div>'
-    f'<div class="hd-px"><span class="hd-big" style="color:{col}">{px(last)}</span>'
-    f'<span class="hd-chg" style="color:{col}">{arrow} {abs(chg):,.{DEC}f} &nbsp; {pct:+.2f}%</span></div>'
-    f'<div style="font-size:13px;color:#888;margin-top:6px">거래량 {vol:,.0f}</div>'
+    f'<div class="hd-px"><span class="hd-big" style="color:{col}">{last:,.0f}</span>'
+    f'<span class="hd-chg" style="color:{col}">{arrow} {abs(chg):,.0f} &nbsp; {pct:+.2f}%</span></div>'
+    f'<div style="font-size:13px;color:#888;margin-top:6px">오늘 거래량 {vol:,.0f}</div>'
     '</div>'
     '<div class="hd-lines">'
-    f'<div class="hd-lbl" data-ul="1" style="color:#1a56db;font-weight:600">매도선<br>(<span data-k="u">{_up:,.{DEC}f}</span>)</div>'
-    f'<div class="hd-lbl" data-ul="1" style="color:#e5484d;font-weight:600">매수선<br>(<span data-k="l">{_lo:,.{DEC}f}</span>)</div>'
+    f'<div class="hd-lbl" data-ul="1" style="color:#1a56db;font-weight:600">매도선<br>(<span data-k="u">{_up:,.0f}</span>)</div>'
+    f'<div class="hd-lbl" data-ul="1" style="color:#e5484d;font-weight:600">매수선<br>(<span data-k="l">{_lo:,.0f}</span>)</div>'
     '</div>'
     f'{_sig}'
     '</div>',
@@ -415,7 +453,7 @@ def direction_colors(v):
 
 
 def base_traces(fig):
-    fig.add_trace(go.Candlestick(x=dates, open=ov, high=hv, low=lv, close=yv, name="수정종가", showlegend=False,
+    fig.add_trace(go.Candlestick(x=dates, open=ov, high=hv, low=lv, close=yv, name=f"{BAR_MIN}분봉", showlegend=False,
                                  increasing=dict(line=dict(color="#e5484d", width=1), fillcolor="#e5484d"),
                                  decreasing=dict(line=dict(color="#3b6fd4", width=1), fillcolor="#3b6fd4")), row=1, col=1)
     fig.add_trace(go.Scatter(x=dates, y=curvev, name="곡선추세", line=dict(color="#111111", width=1.5)), row=1, col=1)
@@ -430,8 +468,7 @@ def base_traces(fig):
 
 
 CROSSHAIR_JS = """
-function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LOW, ANCH, IDX2, IT2, HIGH, DEC){
-  DEC=DEC||0;              // 가격 소수 자릿수 (국내 0, 미국 2)
+function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LOW, ANCH, IDX2, IT2, HIGH){
   var LP_MS=500;           // 길게 눌러 진동이 오기까지의 시간(ms)
   var CROSS_DELAY_MS=150;  // 진동 후 십자선이 나타나기까지의 시간(ms) (진동 → 십자선 순서 맞춤)
   var PAN_GAIN=1.5;        // 손가락 이동 속도 배율
@@ -440,8 +477,6 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
   var SAME_BAND_LEVEL=2;    // level: 가격 차이가 ±2% 이내면 '보합'
   var SAME_BAND_DAILY=0.3;  // daily: 등락률 차이가 ±0.3%p 이내면 '보합'
   var idxOn=true;          // 지수 비교선 표시 여부
-  var RPAD_RATIO=0.08;     // 오른쪽 여백: 보이는 기간의 8%만큼 빈 칸 (120일 → 약 10칸, 폰 42일 → 약 3칸)
-  var RPAD_MIN=3;          // 오른쪽 여백 최소 칸 수
   // 브라우저(앱 브라우저)가 두 손가락으로 화면 전체를 확대하지 못하게 막기
   try{
     var pd=window.parent.document, mv=pd.querySelector('meta[name=viewport]');
@@ -454,15 +489,15 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
   gd.style.position='relative'; gd.style.touchAction='pan-y';
   gd.style.userSelect='none'; gd.style.webkitUserSelect='none';
   gd.style.webkitTouchCallout='none'; gd.style.webkitTapHighlightColor='transparent';
-  var cats=gd.data[0].x, N=cats.length, MINS=Math.min(20,N), MAXS=Math.min(Math.max(120,initSpan),N);
+  var cats=gd.data[0].x, N=cats.length, MINS=Math.min(20,N), MAXS=Math.min(Math.max(240,initSpan),N);   // 5분봉: 최대 240봉(약 3일)까지 축소
   function clampSpan(v){return Math.round(Math.max(MINS,Math.min(MAXS,v)));}
   function clampI0(v,sp){return Math.round(Math.max(0,Math.min(N-sp,v)));}
-  // 핸드폰(화면 폭 600px 이하)은 처음에 약 2달(42거래일)만 확대해서 보여줌. PC는 그대로.
+  // 핸드폰(화면 폭 600px 이하)은 처음에 42봉(약 3시간 반)만 확대해서 보여줌. PC는 그대로.
   var PHONE_SPAN=42, ITa=IT;
   var isPhone=false;
   try{ isPhone=Math.min(window.screen&&window.screen.width||9999, window.innerWidth||9999)<=600; }catch(e0){}
   if(isPhone && initSpan>PHONE_SPAN && IDX && IDX2 && IDX2.length===N){
-    try{   // 폰: 2달치 기준으로 미리 환산해 둔 지수선으로 교체(보이기/숨기기만 사용)
+    try{   // 폰: 42봉 기준으로 미리 환산해 둔 지수선으로 교체(보이기/숨기기만 사용)
       IDX=IDX2; ITa=IT2; initSpan=PHONE_SPAN;
       var pr0=Plotly.restyle(gd,{visible:[false]},[IT]); if(pr0&&pr0.then)pr0.then(null,function(){});
       var pr1=Plotly.restyle(gd,{visible:[true]},[IT2]); if(pr1&&pr1.then)pr1.then(null,function(){});
@@ -488,7 +523,7 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
   var focus=N-1;           // 십자선이 가리키는 날짜(없으면 맨 오른쪽=최근)
   function sg(v){return (v>=0?'+':'')+v.toFixed(1)+'%';}
   function md(i){return cats[i].slice(5);}
-  function pxs(v){return Number(v).toLocaleString('en-US',{minimumFractionDigits:DEC,maximumFractionDigits:DEC});}
+  function pxs(v){return Number(v).toLocaleString('en-US',{maximumFractionDigits:0});}
   function updateSummary(){   // 선택한 날짜(없으면 최근 날짜)의 종목 가격과 지수로 강함/약함/보합 판단
     var D0=focus;
     try{
@@ -536,7 +571,7 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
   function showErr(e){dbg.style.display='block'; dbg.textContent='차트 오류: '+(e&&e.message?e.message:e);}
   function hide(){[vl,hl,dl,pr].forEach(function(e){e.style.display='none';}); if(focus!==N-1){focus=N-1; updateSummary();}}
 
-  function fmt(c){return c.slice(5).replace('-','.');}
+  function fmt(c){return c.length>10 ? c.slice(5,10).replace('-','.')+' '+c.slice(11,16) : c.slice(5).replace('-','.');}   // 11.20 09:05
 
   // 보이는 구간의 최고/최저에 맞춰 가격 범위를 즉시 변경 + 지수선을 맨 왼쪽 종가에 맞춰 환산
   function draw(){
@@ -550,8 +585,7 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
     var pad=(hi-lo)*0.06||1;
     var step=Math.max(3,Math.round(span/4)), tv=[], tt=[], idx;
     for(idx=N-1;idx>=a;idx-=step){tv.push(cats[idx]); tt.push(fmt(cats[idx]));}
-    var rp=Math.max(RPAD_MIN,Math.round(span*RPAD_RATIO));   // 오늘 캔들이 오른쪽 끝에 붙지 않게 빈 칸 추가
-    var xr=[i0-0.5,i0+span-0.5+rp];
+    var xr=[i0-0.5,i0+span-0.5];
     var lay={'xaxis.range':xr,'xaxis2.range':xr,
       'yaxis.range':[lo-pad,hi+pad],'yaxis2.range':[bl*1.1,(bh*1.1)||1],
       'xaxis.tickvals':tv,'xaxis.ticktext':tt,'xaxis2.tickvals':tv,'xaxis2.ticktext':tt};
@@ -584,11 +618,11 @@ function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LO
     if(!isFinite(xs))return;
     var ax=(y>=yb._offset)?yb:ya;
     var v=ax.range[1]-(y-ax._offset)/ax._length*(ax.range[1]-ax.range[0]);
-    var txt=pxs(v);
+    var txt=Math.round(v).toLocaleString('en-US');
     vl.style.cssText+=';display:block;left:'+xs+'px;top:'+s.t+'px;height:'+s.h+'px;';
     hl.style.cssText+=';display:block;left:'+s.l+'px;top:'+y+'px;width:'+s.w+'px;';
     var showI=!!(IDX&&IDXRAW&&idxOn);
-    // 예) 2026-10-20 (줄바꿈) (11,700 , 5,600.00)  → 날짜 / (그날 종목 가격 , 그날 지수)
+    // 예) 2026-11-20 10:35 (줄바꿈) (11,700 , 5,600.00)  → 시각 / (그 봉 종가 , 그 시각 지수)
     dl.textContent=cats[idx]+'\\n('+pxs(S[0][idx])+(showI?' , '+f2(IDXRAW[idx]):'')+')';
     dl.style.display='block'; dl.style.top=(ya._offset+ya._length+2)+'px';
     var half=(dl.offsetWidth||0)/2, tot=fl.width||gd.clientWidth||0;
@@ -715,24 +749,29 @@ def finish(fig, low_label):
     pos = sorted({m - 1 - int(round(i * (m - 1) / 3.6)) for i in range(4)})
     fig.update_xaxes(type="category", tickmode="array",
                      tickvals=[dates[i] for i in pos],
-                     ticktext=[pd.to_datetime(dates[i]).strftime("%m.%d") for i in pos],
+                     ticktext=[pd.to_datetime(dates[i]).strftime("%m.%d %H:%M") for i in pos],
                      tickangle=0, tickfont=dict(size=11, color="#555"),
                      showgrid=True, gridcolor="#f0b8b8", gridwidth=1,
                      showline=False, zeroline=False)
     fig.update_xaxes(showticklabels=True, row=1, col=1)    # 날짜는 위 차트 아래(두 차트 사이)에 표시
     fig.update_xaxes(showticklabels=False, row=2, col=1)
-    fig.update_yaxes(side="right", tickformat=(",.2f" if US and last < 100 else ",.0f"), tickfont=dict(size=11, color="#555"),
+    fig.update_yaxes(side="right", tickformat=",.0f", tickfont=dict(size=11, color="#555"),
                      showgrid=True, gridcolor="#eeeeee", zeroline=False, showline=False, ticks="")
     fig.update_yaxes(nticks=4, row=2, col=1)
+    # 날짜가 바뀌는 곳에 옅은 세로 점선 (어디서부터 오늘인지 쉽게 구분)
+    for i in range(1, m):
+        if dates[i][:10] != dates[i - 1][:10]:
+            fig.add_shape(type="line", xref="x", yref="paper", x0=i - 0.5, x1=i - 0.5, y0=0, y1=1,
+                          line=dict(color="#bbbbbb", width=1, dash="dot"), layer="below")
     tagc = "#e5484d" if chg > 0 else "#3b6fd4"
     # 현재가 태그(오른쪽 축)
     fig.add_annotation(xref="paper", x=1.0, xanchor="left", yref="y", y=yv[-1], showarrow=False,
-                       text=f"{last:,.{DEC}f}<br>{pct:+.2f}%", align="left", borderpad=2,
+                       text=f"{last:,.0f}<br>{pct:+.2f}%", align="left", borderpad=2,
                        font=dict(color="white", size=11), bgcolor=tagc)
     # 범례(차트 위 한 줄)
     fig.add_annotation(xref="paper", yref="paper", x=0.0, y=1.0, xanchor="left", yanchor="bottom",
                        showarrow=False, font=dict(size=11),
-                       text=('<span style="color:#e5484d">▮</span><span style="color:#3b6fd4">▮</span> <span style="color:#111111">수정종가 캔들</span>  '
+                       text=(f'<span style="color:#e5484d">▮</span><span style="color:#3b6fd4">▮</span> <span style="color:#111111">{BAR_MIN}분봉 캔들</span>  '
                              '<span style="color:#111111">━ 곡선</span>  '
                              '<span style="color:#1a56db">━ 상한</span>  '
                              '<span style="color:#e5484d">━ 하한</span>'))
@@ -758,10 +797,10 @@ def show(fig, div_id, bars):
     open_json = dump(pack(ov))
     low_json = dump(pack(lv))
     idx2_json = dump(pack(idx_scaled_p)) if idx_scaled_p is not None else "null"
-    post = "installCrosshair(document.getElementById('{plot_id}'), %d, %s, %s, %s, %d, %s, %s, %s, %s, %d, %s, %d, %s, %d);" % (
+    post = "installCrosshair(document.getElementById('{plot_id}'), %d, %s, %s, %s, %d, %s, %s, %s, %s, %d, %s, %d, %s);" % (
         init_span, dump(series), dump(pack(bars)),
         idx_json, (4 if idx_scaled is not None else -1), json.dumps(idx_name),
-        raw_json, open_json, low_json, n - init_span, idx2_json, 5, dump(pack(hv)), DEC)
+        raw_json, open_json, low_json, n - init_span, idx2_json, 5, dump(pack(hv)))
     html = "<script>" + CROSSHAIR_JS + "</script>" + fig.to_html(
         full_html=False, include_plotlyjs="cdn", div_id=div_id,
         config={"staticPlot": True, "responsive": True},
@@ -777,6 +816,11 @@ fig.add_trace(go.Bar(x=dates, y=cv, marker_color=direction_colors(curvev),
 show(finish(fig, "곡선추세 방향"), "chart_trend", cv)
 status.empty()
 if idx_arr is None:
-    st.caption("※ 지수 데이터를 불러오지 못해 비교선 없이 표시 중입니다.")
-elif idx_note:
-    st.caption(idx_note)
+    st.caption("※ 지수 분봉을 불러오지 못해 비교선 없이 표시 중입니다.")
+_c1, _c2 = st.columns([1, 3])
+with _c1:
+    if st.button("🔄 새로고침", use_container_width=True):   # 1분마다 자동으로 새 시세를 받지만, 바로 받고 싶을 때
+        load_both.clear()
+        st.rerun()
+with _c2:
+    st.caption(f"기준 {df.index[-1]:%m-%d %H:%M} · {BAR_MIN}분봉 {n}개로 계산 · 데이터: {data_src} · 1분 간격 갱신")
