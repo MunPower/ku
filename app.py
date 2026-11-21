@@ -295,7 +295,12 @@ try:
     df, _idf = load_both(code.strip(), idx_sym, calc)
 except Exception as e:
     status.empty()
-    st.error(f"데이터를 불러오지 못했습니다: {e}")
+    if isinstance(e, KeyError) or "timestamp" in str(e) or "No data" in str(e):
+        # 야후에 시세가 하나도 없을 때 나는 오류 → 알아보기 쉬운 말로 안내
+        st.warning(f"'{code}' 시세를 찾지 못했습니다. 티커가 틀렸거나, 상장폐지·거래중지된 종목일 수 있어요."
+                   + (" 미국 종목은 티커(예: AAPL)나 한글 이름(예: 애플)으로 다시 검색해 보세요." if US else ""))
+    else:
+        st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
 if df.empty:
     status.empty()
