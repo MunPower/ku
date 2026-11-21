@@ -62,11 +62,11 @@ US_KO = {
     "PYPL": ("페이팔", "NASDAQ"), "ARM": ("암홀딩스", "NASDAQ"), "SMCI": ("슈퍼마이크로컴퓨터", "NASDAQ"),
     "MSTR": ("마이크로스트래티지", "NASDAQ"), "COIN": ("코인베이스", "NASDAQ"), "ABNB": ("에어비앤비", "NASDAQ"),
     "RIVN": ("리비안", "NASDAQ"), "LCID": ("루시드", "NASDAQ"), "QQQ": ("나스닥100 ETF", "NASDAQ"),
-    "TQQQ": ("나스닥100 3배 ETF", "NASDAQ"), "SOXL": ("반도체 3배 ETF", "NASDAQ"),
+    "TQQQ": ("나스닥100 3배 ETF", "NASDAQ"), "SOXL": ("반도체 3배 ETF", "NYSE"),
     "IONQ": ("아이온큐", "NYSE"), "TSM": ("TSMC 대만반도체", "NYSE"), "BRK-B": ("버크셔해서웨이", "NYSE"),
     "JPM": ("제이피모건", "NYSE"), "V": ("비자", "NYSE"), "MA": ("마스터카드", "NYSE"),
     "KO": ("코카콜라", "NYSE"), "DIS": ("디즈니", "NYSE"), "NKE": ("나이키", "NYSE"),
-    "MCD": ("맥도날드", "NYSE"), "WMT": ("월마트", "NYSE"), "JNJ": ("존슨앤드존슨", "NYSE"),
+    "MCD": ("맥도날드", "NYSE"), "WMT": ("월마트", "NASDAQ"), "JNJ": ("존슨앤드존슨", "NYSE"),
     "PFE": ("화이자", "NYSE"), "LLY": ("일라이릴리", "NYSE"), "NVO": ("노보노디스크", "NYSE"),
     "XOM": ("엑슨모빌", "NYSE"), "BA": ("보잉", "NYSE"), "ORCL": ("오라클", "NYSE"),
     "CRM": ("세일즈포스", "NYSE"), "IBM": ("아이비엠", "NYSE"), "UBER": ("우버", "NYSE"),
@@ -350,13 +350,54 @@ def _yf_5m(sym: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=50, show_spinner=False)
 def load_us5(code: str, idx_sym: str, bars: int):
-    """미국 종목·지수 5분봉을 동시에 받는다. 지수는 실패하면 None"""
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_s = ex.submit(_yf_5m, code.replace(".", "-"))
-        f_i = ex.submit(_safe, _yf_5m, US_IDX_YF.get(idx_sym, "^GSPC"))
-        stock = f_s.result().tail(int(bars))
+    """미국 종목·지수 5분봉을 동시에 받는다. 지수는 실패하면 None.
+    5분봉 마지막 값(15:55봉)은 공식 종가와 조금 다를 수 있어서, 일봉의 공식 종가·전일 종가로 맞춘다"""
+    isym = US_IDX_YF.get(idx_sym, "^GSPC")
+    tk = code.replace(".", "-")
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_s = ex.submit(_yf_5m, tk)
+        f_i = ex.submit(_safe, _yf_5m, isym)
+        f_sd = ex.submit(_safe, _yf_1d, tk)
+        f_id = ex.submit(_safe, _yf_1d, isym)
+        stock = _fix_close(f_s.result(), f_sd.result()).tail(int(bars))
         idx = f_i.result()
+        if idx is not None and not idx.empty:
+            idx = _fix_close(idx, f_id.result())
     return stock, (idx if idx is not None and not idx.empty else None), "야후 파이낸스 5분봉"
+
+
+def _yf_1d(sym: str) -> pd.DataFrame:
+    """야후 일봉 (공식 종가 확인용, 수정주가 아님 = 네이버와 같은 기준)"""
+    import yfinance as yf
+    d = yf.Ticker(sym).history(period="10d", interval="1d", auto_adjust=False, actions=False)
+    if d is None or d.empty:
+        return None
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    idx = d.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("America/New_York").tz_localize(None)
+    d.index = idx.normalize()
+    return d.dropna(subset=["Close"])
+
+
+def _fix_close(d5: pd.DataFrame, d1) -> pd.DataFrame:
+    """그날 마지막 5분봉 종가 = 일봉 종가(장중엔 현재가, 장 마감 후엔 공식 종가). 전일 종가도 일봉에서 가져옴"""
+    if d5 is None or d5.empty or d1 is None or d1.empty:
+        return d5
+    d5 = d5.copy()
+    day = d5.index[-1].normalize()
+    if day in d1.index:
+        c = float(d1.loc[day, "Close"])
+        if c > 0:
+            k = d5.index[-1]
+            d5.loc[k, "Close"] = c
+            d5.loc[k, "High"] = max(float(d5.loc[k, "High"]), c)
+            d5.loc[k, "Low"] = min(float(d5.loc[k, "Low"]), c)
+        before = d1[d1.index < day]
+        if not before.empty:
+            d5.attrs["prev_close"] = float(before["Close"].iloc[-1])
+    return d5
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -833,29 +874,45 @@ def page():
         idx_sym, idx_name = ("IXIC", "나스닥") if mkt == "NASDAQ" else ("US500", "S&P500")
     else:       # 국내: 네이버 지수 분봉
         idx_sym, idx_name = ("KOSDAQ", "코스닥") if mkt == "KOSDAQ" else ("KOSPI", "코스피")
-    us_err = ""
-    try:
+    # 시세 받기 — 한 번 실패해도 차트를 지우지 않고 바로 전 시세로 계속 보여줌 (차트가 지워졌다 다시 생기면 화면이 하얘짐)
+    us_err, stale_note = "", ""
+    LAST_KEY = f"last_ok_{code}"
+    last_ok = st.session_state.get(LAST_KEY)          # (df, 지수, 출처) — 이 종목에서 마지막으로 성공한 시세
+
+    def _fetch():
         if US:
-            try:                                   # 미국: 야후 5분봉 → 안 되면 주식002처럼 일봉
-                df, _idf, data_src = load_us5(code.strip(), idx_sym, calc)
-                if len(df) < 60:
-                    raise ValueError(f"5분봉 {len(df)}개뿐")
+            try:                                   # 미국: 야후 5분봉
+                d, i_, src_ = load_us5(code.strip(), idx_sym, calc)
+                if len(d) < 60:
+                    raise ValueError(f"5분봉 {len(d)}개뿐")
+                return d, i_, src_
             except Exception as e5:
-                us_err = str(e5)[:80]
-                df, _idf, data_src = load_daily(code.strip(), idx_sym, calc)
-        else:
-            df, _idf, data_src = load_both(code.strip(), idx_sym, calc)
+                if last_ok is not None and not last_ok[2].endswith("일봉"):
+                    raise                          # 5분봉을 보던 중이면 일봉으로 바꾸지 않고 직전 5분봉 유지
+                nonlocal_err[0] = str(e5)[:80]
+                return load_daily(code.strip(), idx_sym, calc)   # 처음부터 5분봉이 안 되면 주식002처럼 일봉
+        return load_both(code.strip(), idx_sym, calc)
+
+    nonlocal_err = [""]
+    try:
+        df, _idf, data_src = _fetch()
+        if df is None or df.empty or len(df) < 60:
+            raise ValueError(f"데이터 부족(받은 개수 {0 if df is None else len(df)}개)")
+        if (_idf is None or _idf.empty) and last_ok is not None and last_ok[1] is not None:
+            _idf = last_ok[1]                      # 지수만 실패하면 직전 지수 사용 (지수선이 사라졌다 생기지 않게)
+        st.session_state[LAST_KEY] = (df, _idf, data_src)
     except Exception as e:
-        status.empty()
-        st.error(f"데이터를 불러오지 못했습니다: {e}")
-        st.stop()
+        if last_ok is not None:
+            df, _idf, data_src = last_ok
+            stale_note = f"⚠ {pd.Timestamp.now(tz='Asia/Seoul'):%H:%M:%S} 시세 받기 실패 → 직전 시세로 표시 중 (다음 갱신 때 다시 시도)"
+        else:
+            status.empty()
+            st.error(f"데이터를 불러오지 못했습니다: {e}  (6자리 종목코드나 미국 티커를 확인하세요)")
+            st.stop()
+    us_err = nonlocal_err[0]
     INTRA = not (US and data_src.endswith("일봉"))    # True = 5분봉, False = 일봉(미국 5분봉 실패 시)
     BAR_LBL = f"{BAR_MIN}분봉" if INTRA else "일봉"
     badge = badge.replace(f">{BAR_MIN}분봉<", f">{BAR_LBL}<")
-    if df.empty or len(df) < 60:
-        status.empty()
-        st.warning(f"{BAR_LBL} 데이터가 부족합니다(60개 이상 필요, 받은 개수 {len(df)}개). 종목코드를 확인하세요.")
-        st.stop()
 
     y = df["Close"].to_numpy(dtype=float)
     n = len(y)
@@ -913,7 +970,8 @@ def page():
     _today = _day[-1]
     _prev_days = df.iloc[:-1] if not INTRA else df[_day < _today]
     last = y[-1]
-    prev = float(_prev_days["Close"].iloc[-1]) if not _prev_days.empty else float(df["Open"][_day == _today].iloc[0])
+    _pc = df.attrs.get("prev_close") if INTRA else None   # 미국: 일봉의 공식 전일 종가
+    prev = float(_pc) if _pc else float(_prev_days["Close"].iloc[-1]) if not _prev_days.empty else float(df["Open"][_day == _today].iloc[0])
     chg = last - prev
     pct = chg / prev * 100
     col = "#e5484d" if chg > 0 else ("#3b6fd4" if chg < 0 else "#333333")
@@ -1081,6 +1139,8 @@ def page():
     with _c2:
         _now = pd.Timestamp.now(tz="Asia/Seoul")
         _auto_txt = f"{REFRESH_SEC}초마다 자동 갱신 (마지막 {_now:%H:%M:%S})" if _frag else "자동 갱신 안 됨: streamlit 업데이트 필요"
+        if stale_note:
+            st.caption(stale_note)
         if not INTRA:
             st.caption(f"미국 5분봉을 받지 못해 일봉으로 표시합니다 ({us_err}) · 기준 {df.index[-1]:%Y-%m-%d} · 데이터: {data_src}")
         else:
