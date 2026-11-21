@@ -53,11 +53,12 @@ US_KO = {
     "PYPL": ("페이팔", "NASDAQ"), "ARM": ("암홀딩스", "NASDAQ"), "SMCI": ("슈퍼마이크로컴퓨터", "NASDAQ"),
     "MSTR": ("마이크로스트래티지", "NASDAQ"), "COIN": ("코인베이스", "NASDAQ"), "ABNB": ("에어비앤비", "NASDAQ"),
     "RIVN": ("리비안", "NASDAQ"), "LCID": ("루시드", "NASDAQ"), "QQQ": ("나스닥100 ETF", "NASDAQ"),
-    "TQQQ": ("나스닥100 3배 ETF", "NASDAQ"), "SOXL": ("반도체 3배 ETF", "NASDAQ"),
+    "TQQQ": ("나스닥100 3배 ETF", "NASDAQ"), "SOXL": ("반도체 3배 ETF", "NYSE"),   # NYSE Arca 상장
     "IONQ": ("아이온큐", "NYSE"), "TSM": ("TSMC 대만반도체", "NYSE"), "BRK-B": ("버크셔해서웨이", "NYSE"),
     "JPM": ("제이피모건", "NYSE"), "V": ("비자", "NYSE"), "MA": ("마스터카드", "NYSE"),
     "KO": ("코카콜라", "NYSE"), "DIS": ("디즈니", "NYSE"), "NKE": ("나이키", "NYSE"),
-    "MCD": ("맥도날드", "NYSE"), "WMT": ("월마트", "NYSE"), "JNJ": ("존슨앤드존슨", "NYSE"),
+    "MCD": ("맥도날드", "NYSE"), "WMT": ("월마트", "NASDAQ"),   # 월마트: 2025-12 뉴욕→나스닥 이전
+    "JNJ": ("존슨앤드존슨", "NYSE"),
     "PFE": ("화이자", "NYSE"), "LLY": ("일라이릴리", "NYSE"), "NVO": ("노보노디스크", "NYSE"),
     "XOM": ("엑슨모빌", "NYSE"), "BA": ("보잉", "NYSE"), "ORCL": ("오라클", "NYSE"),
     "CRM": ("세일즈포스", "NYSE"), "IBM": ("아이비엠", "NYSE"), "UBER": ("우버", "NYSE"),
@@ -92,8 +93,11 @@ def to_ko(name: str) -> str:
     return re.sub(r"[A-Za-z]+", rep, t)
 
 
+LIST_VER = 2   # 종목 목록 구성을 바꾸면 이 숫자를 올림 → 하루 동안 저장된 옛 목록 대신 새로 받음
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def listing() -> pd.DataFrame:
+def listing(ver: int = LIST_VER) -> pd.DataFrame:
     """종목명 검색용 목록 (국내 주식 + 국내 ETF + 미국 나스닥·뉴욕·아멕스 + 미국 ETF)"""
     # (목록 이름, 거래소 표시) — 국내는 목록 안의 Market 값으로 코스피/코스닥을 나눔
     SOURCES = (("KRX", ""), ("ETF/KR", "ETF"), ("NASDAQ", "NASDAQ"), ("NYSE", "NYSE"),
@@ -176,7 +180,7 @@ q = st.text_input("종목 검색", placeholder="🔍 종목코드·종목명 (�
 # 종목 목록은 검색할 때(또는 다른 종목을 보고 있을 때)만 불러온다 → 처음 화면이 바로 뜸
 if q or st.session_state.code != DEFAULT_CODE:
     with st.spinner("종목 목록(국내·미국)을 불러오는 중입니다… 처음 한 번은 조금 걸릴 수 있어요"):
-        lst = listing()
+        lst = listing(LIST_VER)
 else:
     lst = pd.DataFrame(columns=["Code", "Name", "nn", "nk", "mkt", "disp"])
 names = dict(zip(lst["Code"], lst["disp"]))
@@ -184,7 +188,7 @@ mkts = dict(zip(lst["Code"], lst["mkt"]))        # 코스피/코스닥/나스닥
 names.setdefault(DEFAULT_CODE, "KODEX 200TR")   # 종목 목록 없이도 기본 종목 이름 표시
 for _k, (_ko, _m) in US_KO.items():             # 목록을 못 받아도 인기 미국 종목은 한글 이름 표시
     names.setdefault(_k, _ko)
-    mkts.setdefault(_k, _m)
+    mkts[_k] = _m                             # 거래소는 이 표가 우선 (저장된 목록이 옛것이어도)
 MKT_KO = {"NASDAQ": "나스닥", "NYSE": "뉴욕", "AMEX": "아멕스", "US": "미국"}
 if q:
     qu = q.upper().replace(".", "-")
