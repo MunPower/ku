@@ -64,6 +64,7 @@ US_KO = {
     "CRM": ("세일즈포스", "NYSE"), "IBM": ("아이비엠", "NYSE"), "UBER": ("우버", "NYSE"),
     "BABA": ("알리바바", "NYSE"), "SPY": ("S&P500 ETF", "NYSE"), "VOO": ("뱅가드 S&P500 ETF", "NYSE"),
     "SCHD": ("슈왑 배당 ETF", "NYSE"),
+    "ANT": ("앤트로픽 Anthropic", "NASDAQ"),   # 2026-11-19 나스닥 상장
 }
 US_MKTS = ("NASDAQ", "NYSE", "AMEX", "US")
 
@@ -93,7 +94,7 @@ def to_ko(name: str) -> str:
     return re.sub(r"[A-Za-z]+", rep, t)
 
 
-LIST_VER = 2   # 종목 목록 구성을 바꾸면 이 숫자를 올림 → 하루 동안 저장된 옛 목록 대신 새로 받음
+LIST_VER = 3   # 종목 목록 구성을 바꾸면 이 숫자를 올림 → 하루 동안 저장된 옛 목록 대신 새로 받음
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -208,6 +209,8 @@ if q:
         elif kind == "list":                                        # 일부만 입력 → 연관 종목에서 선택
             opts = [f"{r.disp}{' · ' + MKT_KO[r.mkt] if r.mkt in MKT_KO else ''} ({r.Code})"
                     for r in m.head(30).itertuples()]
+            if re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", qu) and qu not in set(m["Code"]):
+                opts.insert(0, f"🔎 {qu} 티커로 바로 보기 ({qu})")   # 목록에 아직 없는 새 상장 종목 등
             sel = st.selectbox("연관 종목", opts, index=None, key=f"sel_{norm(q)}",
                                placeholder=f"연관 종목 {len(m)}개 — 여기서 선택", label_visibility="collapsed")
             if sel:
@@ -294,9 +297,35 @@ except Exception as e:
     status.empty()
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
-if df.empty or len(df) < 60:
+if df.empty:
     status.empty()
-    st.warning("데이터가 부족합니다(60개 이상 필요). 종목코드를 확인하세요.")
+    st.warning("시세를 찾지 못했습니다. 종목코드·티커를 확인하세요.")
+    st.stop()
+if len(df) < 60:   # 새로 상장한 종목 등: 추세선은 계산할 수 없으니 캔들만 간단히 표시
+    status.empty()
+    _c = df["Close"].astype(float)
+    _l = float(_c.iloc[-1])
+    _p = float(df["Open"].iloc[0]) if len(_c) < 2 else float(_c.iloc[-2])
+    _d = _l - _p
+    _col = "#e5484d" if _d > 0 else ("#3b6fd4" if _d < 0 else "#333333")
+    _ar = "▲" if _d > 0 else ("▼" if _d < 0 else "-")
+    st.markdown(
+        f'<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">'
+        f'<span style="font-size:42px;font-weight:700;color:{_col};line-height:1">{px(_l)}</span>'
+        f'<span style="font-size:16px;color:{_col}">{_ar} {abs(_d):,.{DEC}f} &nbsp; {(_d / _p * 100 if _p else 0):+.2f}%</span>'
+        f'<span style="font-size:13px;color:#888">거래량 {float(df["Volume"].iloc[-1]):,.0f}</span></div>',
+        unsafe_allow_html=True)
+    st.info(f"상장(거래)된 지 {len(df)}일째라 매도선·매수선·곡선추세는 아직 계산할 수 없어요. "
+            "60거래일(약 3달)이 쌓이면 다른 종목처럼 나옵니다. 지금은 캔들만 보여드려요.")
+    _f = go.Figure(go.Candlestick(
+        x=df.index.strftime("%Y-%m-%d"), open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        increasing=dict(line=dict(color="#e5484d"), fillcolor="#e5484d"),
+        decreasing=dict(line=dict(color="#3b6fd4"), fillcolor="#3b6fd4")))
+    _f.update_xaxes(type="category", tickangle=0)
+    _f.update_yaxes(side="right", tickformat=(",.2f" if US else ",.0f"))
+    _f.update_layout(height=420, margin=dict(l=4, r=58, t=10, b=22), showlegend=False,
+                     xaxis_rangeslider_visible=False, dragmode=False, plot_bgcolor="white", paper_bgcolor="white")
+    st.plotly_chart(_f, use_container_width=True, config={"staticPlot": True})
     st.stop()
 
 y = df["Close"].to_numpy(dtype=float)
